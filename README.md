@@ -25,20 +25,26 @@ Then in your tests:
 ```rust
 use mockllm::{MockLlmServer, Response};
 
+// Async — use in #[tokio::test]
 #[tokio::test]
-async fn test_my_llm_app() {
+async fn test_async() {
     let mock = MockLlmServer::builder()
-        .next(Response::text("Hello! How can I help?"))
+        .next(Response::text("Hello!"))
         .build()
         .await;
+    let url = mock.url(); // http://127.0.0.1:<port>/v1
+    // ... make requests ...
+}
 
-    // Point your OpenAI-compatible client at mock.url()
-    let api_url = mock.url(); // e.g. http://127.0.0.1:54321/v1
-
-    // ... make requests through your app ...
-
-    assert_eq!(mock.request_count(), 1);
-    assert_eq!(mock.remaining_responses(), 0);
+// Sync — use in regular #[test], no runtime conflicts
+#[test]
+fn test_sync() {
+    let mock = MockLlmServer::builder()
+        .next(Response::text("Hello!"))
+        .start(); // creates its own runtime on a background thread
+    let url = mock.url();
+    // ... test with blocking HTTP client ...
+    // server shuts down when `mock` is dropped
 }
 ```
 
@@ -137,6 +143,16 @@ async fn main() {
 Without a fallback, exhausted requests return a default
 `"[mockllm] No more scripted responses."` message.
 
+There's also a built-in echo fallback that returns the request body as the
+response text — useful for verifying serialization:
+
+```rust
+let mock = MockLlmServer::builder()
+    .fallback_echo()
+    .build()
+    .await;
+```
+
 ## Request recording
 
 Every request to the mock server is recorded for assertions:
@@ -148,14 +164,33 @@ mock.request_count()
 // Get all recorded request bodies as serde_json::Value
 mock.recorded_requests()
 
-// Get the Nth request body
+// Get the Nth request body, or the first/last
 mock.request(0)
+mock.first_request()
+mock.last_request()
 
 // Get just the messages array from the Nth request
 mock.request_messages(0)
 
 // How many scripted responses haven't been consumed yet
 mock.remaining_responses()
+
+// Assert helpers (panic with clear messages)
+mock.assert_request_count(2);
+mock.assert_auth(0, "Bearer sk-test-key");
+mock.assert_tool_choice(0, "required");
+```
+
+## Header inspection
+
+HTTP headers are recorded alongside request bodies:
+
+```rust
+let headers = mock.request_headers(0).unwrap();
+assert_eq!(headers["authorization"], "Bearer sk-test-key");
+
+// Or use the shorthand:
+mock.assert_auth(0, "Bearer sk-test-key");
 ```
 
 ## Streaming (SSE)

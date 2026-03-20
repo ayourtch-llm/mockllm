@@ -1,5 +1,6 @@
 //! HTTP server implementing OpenAI-compatible `/v1/chat/completions`.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
@@ -19,14 +20,20 @@ use crate::Response;
 /// Receives the full request body as a [`serde_json::Value`].
 pub type FallbackFn = dyn Fn(&Value) -> Response + Send + Sync;
 
+/// A recorded HTTP request (body + headers).
+struct RecordedRequest {
+    body: Value,
+    headers: HashMap<String, String>,
+}
+
 /// Shared state across all request handlers.
 struct ServerState {
     /// Scripted responses, consumed in order.
     responses: Vec<Response>,
     /// Index of the next response to return.
     next_index: usize,
-    /// All received request bodies (for assertions).
-    recorded_requests: Vec<Value>,
+    /// All received requests (body + headers, for assertions).
+    recorded_requests: Vec<RecordedRequest>,
     /// Optional fallback generator for when scripted responses run out.
     fallback: Option<Arc<FallbackFn>>,
 }
@@ -45,6 +52,8 @@ pub struct MockLlmServer {
     state: Arc<Mutex<ServerState>>,
     /// Handle to shut down the server.
     shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Background runtime thread (only set when created via `start()`).
+    _runtime_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MockLlmServer {
@@ -76,12 +85,30 @@ impl MockLlmServer {
 
     /// Get all recorded request bodies.
     pub fn recorded_requests(&self) -> Vec<Value> {
-        self.state.lock().unwrap().recorded_requests.clone()
+        self.state.lock().unwrap().recorded_requests.iter().map(|r| r.body.clone()).collect()
     }
 
     /// Get the Nth recorded request body.
     pub fn request(&self, index: usize) -> Option<Value> {
-        self.state.lock().unwrap().recorded_requests.get(index).cloned()
+        self.state.lock().unwrap().recorded_requests.get(index).map(|r| r.body.clone())
+    }
+
+    /// Get the first recorded request body. Panics with a clear message if none.
+    pub fn first_request(&self) -> Value {
+        self.request(0).expect("mockllm: no requests recorded")
+    }
+
+    /// Get the last recorded request body. Panics with a clear message if none.
+    pub fn last_request(&self) -> Value {
+        let count = self.request_count();
+        assert!(count > 0, "mockllm: no requests recorded");
+        self.request(count - 1).unwrap()
+    }
+
+    /// Assert exactly N requests were made. Panics with details if not.
+    pub fn assert_request_count(&self, expected: usize) {
+        let actual = self.request_count();
+        assert_eq!(actual, expected, "mockllm: expected {expected} requests, got {actual}");
     }
 
     /// Get the messages from the Nth request.
@@ -90,6 +117,28 @@ impl MockLlmServer {
             .and_then(|r| r.get("messages").cloned())
             .and_then(|m| m.as_array().cloned())
             .unwrap_or_default()
+    }
+
+    /// Get recorded HTTP headers for the Nth request.
+    pub fn request_headers(&self, index: usize) -> Option<HashMap<String, String>> {
+        self.state.lock().unwrap().recorded_requests.get(index).map(|r| r.headers.clone())
+    }
+
+    /// Assert the Nth request had a specific Authorization header value.
+    pub fn assert_auth(&self, index: usize, expected: &str) {
+        let headers = self.request_headers(index).expect("mockllm: no request at index");
+        let auth = headers.get("authorization").expect("mockllm: no authorization header");
+        assert_eq!(auth, expected, "mockllm: authorization header mismatch");
+    }
+
+    /// Assert the Nth request used a specific `tool_choice` value.
+    pub fn assert_tool_choice(&self, index: usize, expected: &str) {
+        let req = self.request(index).expect("mockllm: no request at index");
+        assert_eq!(
+            req["tool_choice"], expected,
+            "mockllm: expected tool_choice=\"{expected}\", got {:?}",
+            req["tool_choice"]
+        );
     }
 
     /// How many scripted responses remain unconsumed.
@@ -110,6 +159,10 @@ impl Drop for MockLlmServer {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        // Unpark the background thread so it can exit cleanly
+        if let Some(thread) = self._runtime_thread.take() {
+            thread.thread().unpark();
         }
     }
 }
@@ -161,7 +214,62 @@ impl MockLlmServerBuilder {
         self
     }
 
-    /// Build and start the mock server.
+    /// Set a fallback that echoes back the request body as the response text.
+    ///
+    /// Useful for verifying that your client serializes requests correctly
+    /// without needing to script specific responses.
+    pub fn fallback_echo(self) -> Self {
+        self.fallback(|req| {
+            let text = serde_json::to_string_pretty(req).unwrap_or_default();
+            Response::text(text)
+        })
+    }
+
+    /// Build and start the mock server synchronously.
+    ///
+    /// Creates its own tokio runtime on a background thread. The server
+    /// runs until the returned [`MockLlmServer`] is dropped.
+    ///
+    /// Use this instead of [`build()`](Self::build) when you need mockllm
+    /// in a regular `#[test]` (not `#[tokio::test]`), or when your code
+    /// under test creates its own async runtime.
+    ///
+    /// ```rust
+    /// use mockllm::{MockLlmServer, Response};
+    ///
+    /// let mock = MockLlmServer::builder()
+    ///     .next(Response::text("Hello"))
+    ///     .start();
+    ///
+    /// let url = mock.url();
+    /// // ... test with any HTTP client ...
+    /// // server shuts down when `mock` is dropped
+    /// ```
+    pub fn start(self) -> MockLlmServer {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("mockllm: failed to create runtime");
+            let mut mock = std::mem::ManuallyDrop::new(rt.block_on(self.build()));
+            let state = Arc::clone(&mock.state);
+            let base_url = mock.base_url.clone();
+            let port = mock.port;
+            let shutdown_tx = mock.shutdown_tx.take();
+            tx.send((base_url, port, state, shutdown_tx)).unwrap();
+            // Park the thread — the runtime stays alive, keeping the server running.
+            // When MockLlmServer is dropped, it sends shutdown and this thread can exit.
+            std::thread::park();
+        });
+        let (base_url, port, state, shutdown_tx) = rx.recv().unwrap();
+        MockLlmServer {
+            base_url,
+            port,
+            state,
+            shutdown_tx,
+            _runtime_thread: Some(thread),
+        }
+    }
+
+    /// Build and start the mock server (async).
     ///
     /// Binds to `127.0.0.1:0` (random port) unless a port was specified.
     pub async fn build(self) -> MockLlmServer {
@@ -221,6 +329,7 @@ impl MockLlmServerBuilder {
             port,
             state,
             shutdown_tx: Some(shutdown_tx),
+            _runtime_thread: None,
         }
     }
 }
@@ -250,6 +359,13 @@ async fn handle_request(
     if method == Method::POST
         && (path == "/v1/chat/completions" || path == "/chat/completions")
     {
+        // Capture headers before consuming the request body
+        let headers: HashMap<String, String> = req
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
         // Read body
         let body_bytes = match req.collect().await {
             Ok(collected) => collected.to_bytes(),
@@ -273,7 +389,7 @@ async fn handle_request(
         let (response_json, sse_chunks) = {
             let mut st = state.lock().unwrap();
             let request_body = body_json.clone();
-            st.recorded_requests.push(body_json);
+            st.recorded_requests.push(RecordedRequest { body: body_json, headers });
             let idx = st.next_index;
 
             if idx < st.responses.len() {
@@ -1075,4 +1191,124 @@ mod tests {
         assert!(body.contains("data: [DONE]"));
     }
 
+    #[tokio::test]
+    async fn test_first_and_last_request() {
+        let mock = MockLlmServer::builder()
+            .next(Response::text("a"))
+            .next(Response::text("b"))
+            .next(Response::text("c"))
+            .build()
+            .await;
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/chat/completions", mock.url());
+        for msg in &["first", "second", "third"] {
+            client.post(&url)
+                .json(&serde_json::json!({"model": "t", "messages": [{"role": "user", "content": msg}]}))
+                .send().await.unwrap();
+        }
+
+        assert_eq!(mock.first_request()["messages"][0]["content"], "first");
+        assert_eq!(mock.last_request()["messages"][0]["content"], "third");
+    }
+
+    #[tokio::test]
+    async fn test_assert_request_count() {
+        let mock = MockLlmServer::builder()
+            .next(Response::text("a"))
+            .build()
+            .await;
+
+        let client = reqwest::Client::new();
+        client.post(&format!("{}/chat/completions", mock.url()))
+            .json(&serde_json::json!({"model": "t", "messages": []}))
+            .send().await.unwrap();
+
+        mock.assert_request_count(1); // should not panic
+    }
+
+    #[tokio::test]
+    async fn test_request_headers_and_auth() {
+        let mock = MockLlmServer::builder()
+            .next(Response::text("ok"))
+            .build()
+            .await;
+
+        let client = reqwest::Client::new();
+        client.post(&format!("{}/chat/completions", mock.url()))
+            .header("authorization", "Bearer sk-test-key")
+            .header("x-custom", "hello")
+            .json(&serde_json::json!({"model": "t", "messages": []}))
+            .send().await.unwrap();
+
+        let headers = mock.request_headers(0).unwrap();
+        assert_eq!(headers["authorization"], "Bearer sk-test-key");
+        assert_eq!(headers["x-custom"], "hello");
+
+        mock.assert_auth(0, "Bearer sk-test-key");
+    }
+
+    #[tokio::test]
+    async fn test_assert_tool_choice() {
+        let mock = MockLlmServer::builder()
+            .next(Response::text("ok"))
+            .build()
+            .await;
+
+        let client = reqwest::Client::new();
+        client.post(&format!("{}/chat/completions", mock.url()))
+            .json(&serde_json::json!({
+                "model": "t",
+                "messages": [],
+                "tool_choice": "required"
+            }))
+            .send().await.unwrap();
+
+        mock.assert_tool_choice(0, "required");
+    }
+
+    #[tokio::test]
+    async fn test_fallback_echo() {
+        let mock = MockLlmServer::builder()
+            .fallback_echo()
+            .build()
+            .await;
+
+        let client = reqwest::Client::new();
+        let resp: Value = client.post(&format!("{}/chat/completions", mock.url()))
+            .json(&serde_json::json!({
+                "model": "echo-test",
+                "messages": [{"role": "user", "content": "hello"}]
+            }))
+            .send().await.unwrap().json().await.unwrap();
+
+        let content = resp["choices"][0]["message"]["content"].as_str().unwrap();
+        // The echo should contain the original request body
+        assert!(content.contains("echo-test"));
+        assert!(content.contains("hello"));
+    }
+
+    #[test]
+    fn test_sync_start() {
+        let mock = MockLlmServer::builder()
+            .next(Response::text("sync hello"))
+            .start();
+
+        // Use a blocking HTTP client
+        let client = reqwest::blocking::Client::new();
+        let resp: Value = client
+            .post(&format!("{}/chat/completions", mock.url()))
+            .json(&serde_json::json!({
+                "model": "test",
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+
+        assert_eq!(resp["choices"][0]["message"]["content"], "sync hello");
+        mock.assert_request_count(1);
+        // mock dropped here — server shuts down cleanly
+    }
 }
