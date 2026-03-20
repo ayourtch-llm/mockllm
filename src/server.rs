@@ -974,6 +974,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_connection_error_malformed_http() {
+        // Triggers hyper's serve_connection error (line 203) by sending
+        // garbage that isn't valid HTTP at all.
+        let mock = MockLlmServer::builder()
+            .next(Response::text("still works"))
+            .build()
+            .await;
+
+        let port = mock.port();
+
+        use tokio::io::AsyncWriteExt;
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        // Send binary garbage — not valid HTTP
+        stream.write_all(b"\x00\x01\x02GARBAGE_NOT_HTTP\xff\xfe").await.unwrap();
+        // Shut down the write side so hyper sees EOF
+        stream.shutdown().await.unwrap();
+        drop(stream);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Server should still be healthy
+        let client = reqwest::Client::new();
+        let resp: Value = client
+            .post(&format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&serde_json::json!({"model": "t", "messages": []}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp["choices"][0]["message"]["content"], "still works");
+    }
+
+    #[tokio::test]
     async fn test_streaming_text_and_tool_call() {
         let mock = MockLlmServer::builder()
             .next(Response::text_and_tool_call(
@@ -1036,4 +1074,5 @@ mod tests {
         assert!(body.contains("/tmp"));
         assert!(body.contains("data: [DONE]"));
     }
+
 }
