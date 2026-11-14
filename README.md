@@ -106,6 +106,29 @@ async fn test_tool_calling_loop() {
 }
 ```
 
+## Strict mode: catch requests a real server would refuse
+
+By default the mock accepts any JSON body. With `.strict()` it validates each chat
+request the way a real OpenAI-compatible server does and answers
+`400 invalid_request_error` instead of a scripted response:
+
+- `messages` is a non-empty array of objects with a known `role`;
+- every assistant `tool_calls[i].function.arguments` is a **string holding valid JSON**
+  (servers parse it; vLLM answers `Expecting value: line 1 column 2 (char 1)` for a
+  client that rewrote old arguments into `"[stub] {...}"`);
+- every `tool` message has a `tool_call_id`.
+
+```rust
+let mock = MockLlmServer::builder()
+    .strict()
+    .next(Response::text("ok"))
+    .start();
+// ... run your client ...
+assert_eq!(mock.rejected_count(), 0, "a real server would have refused a request");
+```
+
+A rejected request is still recorded, and does not consume a scripted response.
+
 ## Fallback generation
 
 When scripted responses run out, you can provide a fallback closure that
