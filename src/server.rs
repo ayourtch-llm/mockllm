@@ -36,6 +36,10 @@ struct ServerState {
     recorded_requests: Vec<RecordedRequest>,
     /// Optional fallback generator for when scripted responses run out.
     fallback: Option<Arc<FallbackFn>>,
+    /// Reject requests a real OpenAI-compatible server would reject (see [`MockLlmServerBuilder::strict`]).
+    strict: bool,
+    /// Requests answered 400 by strict validation.
+    rejected: usize,
 }
 
 /// A mock LLM HTTP server for testing.
@@ -63,6 +67,7 @@ impl MockLlmServer {
             responses: Vec::new(),
             port: None,
             fallback: None,
+            strict: false,
         }
     }
 
@@ -141,6 +146,12 @@ impl MockLlmServer {
         );
     }
 
+    /// How many requests strict validation answered with 400 (always 0 unless
+    /// built with [`MockLlmServerBuilder::strict`]).
+    pub fn rejected_count(&self) -> usize {
+        self.state.lock().unwrap().rejected
+    }
+
     /// How many scripted responses remain unconsumed.
     pub fn remaining_responses(&self) -> usize {
         let state = self.state.lock().unwrap();
@@ -172,6 +183,7 @@ pub struct MockLlmServerBuilder {
     responses: Vec<Response>,
     port: Option<u16>,
     fallback: Option<Arc<FallbackFn>>,
+    strict: bool,
 }
 
 impl MockLlmServerBuilder {
@@ -211,6 +223,44 @@ impl MockLlmServerBuilder {
     /// ```
     pub fn fallback(mut self, f: impl Fn(&Value) -> Response + Send + Sync + 'static) -> Self {
         self.fallback = Some(Arc::new(f));
+        self
+    }
+
+    /// Validate each chat request the way a real OpenAI-compatible server does, and
+    /// answer `400 invalid_request_error` instead of a scripted response when it fails.
+    ///
+    /// Off by default, because a lenient mock is handy when you only care about the
+    /// response side. Turn it on to catch requests your client builds that a real
+    /// server would refuse. Checked:
+    /// - `messages` is a non-empty array of objects with a known `role`
+    ///   (`system`, `developer`, `user`, `assistant`, `tool`);
+    /// - every assistant `tool_calls[i].function.arguments` is a **string holding valid
+    ///   JSON** (servers `json.loads` it; e.g. vLLM answers
+    ///   `Expecting value: line 1 column 2 (char 1)` for `"[stub] {...}"`);
+    /// - every `tool` message has a `tool_call_id`.
+    ///
+    /// A rejected request is still recorded (so you can inspect it) but does not
+    /// consume a scripted response. [`MockLlmServer::rejected_count`] counts them.
+    ///
+    /// ```rust
+    /// use mockllm::{MockLlmServer, Response};
+    ///
+    /// let mock = MockLlmServer::builder()
+    ///     .strict()
+    ///     .next(Response::text("ok"))
+    ///     .start();
+    /// let bad = serde_json::json!({"model": "m", "messages": [
+    ///     {"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function",
+    ///         "function": {"name": "shell", "arguments": "[stub] {\"bytes\": 120}"}}]},
+    ///     {"role": "tool", "tool_call_id": "c1", "content": "done"}]});
+    /// let r = reqwest::blocking::Client::new()
+    ///     .post(format!("{}/chat/completions", mock.url())).json(&bad).send().unwrap();
+    /// assert_eq!(r.status(), 400);
+    /// assert_eq!(mock.rejected_count(), 1);
+    /// assert_eq!(mock.remaining_responses(), 1); // the scripted "ok" is still there
+    /// ```
+    pub fn strict(mut self) -> Self {
+        self.strict = true;
         self
     }
 
@@ -278,6 +328,8 @@ impl MockLlmServerBuilder {
             next_index: 0,
             recorded_requests: Vec::new(),
             fallback: self.fallback,
+            strict: self.strict,
+            rejected: 0,
         }));
 
         let bind_addr = format!("127.0.0.1:{}", self.port.unwrap_or(0));
@@ -383,6 +435,18 @@ async fn handle_request(
             }
         };
 
+        {
+            let mut st = state.lock().unwrap();
+            if st.strict {
+                if let Err(msg) = validate_chat_request(&body_json) {
+                    st.recorded_requests.push(RecordedRequest { body: body_json, headers });
+                    st.rejected += 1;
+                    let err = serde_json::json!({"error": {"type": "invalid_request_error", "message": msg}});
+                    return Ok(json_response(StatusCode::BAD_REQUEST, &err));
+                }
+            }
+        }
+
         let is_streaming = body_json.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Record request and get next response
@@ -433,6 +497,53 @@ async fn handle_request(
 }
 
 /// Build a JSON HTTP response.
+/// The checks behind [`MockLlmServerBuilder::strict`]; `Err` carries the 400 message.
+fn validate_chat_request(body: &Value) -> Result<(), String> {
+    let messages = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .ok_or("'messages' must be an array")?;
+    if messages.is_empty() {
+        return Err("'messages' must not be empty".into());
+    }
+    for (i, msg) in messages.iter().enumerate() {
+        let role = msg
+            .get("role")
+            .and_then(|r| r.as_str())
+            .ok_or_else(|| format!("messages[{i}]: missing 'role'"))?;
+        match role {
+            "system" | "developer" | "user" => {}
+            "assistant" => {
+                let calls = match msg.get("tool_calls") {
+                    None | Some(Value::Null) => continue,
+                    Some(c) => c
+                        .as_array()
+                        .ok_or_else(|| format!("messages[{i}].tool_calls must be an array"))?,
+                };
+                for (j, call) in calls.iter().enumerate() {
+                    let at = format!("messages[{i}].tool_calls[{j}].function.arguments");
+                    let args = call
+                        .pointer("/function/arguments")
+                        .ok_or_else(|| format!("{at}: missing"))?
+                        .as_str()
+                        .ok_or_else(|| format!("{at}: must be a string (JSON-encoded)"))?;
+                    if let Err(e) = serde_json::from_str::<Value>(args) {
+                        let head: String = args.chars().take(60).collect();
+                        return Err(format!("{at} is not valid JSON ({e}): {head:?}"));
+                    }
+                }
+            }
+            "tool" => {
+                if msg.get("tool_call_id").and_then(|t| t.as_str()).is_none() {
+                    return Err(format!("messages[{i}]: role 'tool' needs a 'tool_call_id'"));
+                }
+            }
+            other => return Err(format!("messages[{i}]: unknown role {other:?}")),
+        }
+    }
+    Ok(())
+}
+
 fn json_response(
     status: StatusCode,
     body: &Value,
